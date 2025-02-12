@@ -1,0 +1,603 @@
+---
+title: "BCB420 - Computational Systems Biology"
+subtitle: "A1: Dataset Selection and Initial Processing"
+author: "Chloe Nichole Calica"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+bibliography: references.bib
+csl: biomed-central.csl
+---
+# Load Libraries Used
+In this report, four libraries were used for the initial processing of the dataset:
+
+1. **GEOQuery** [@davis2007] to obtain the dataset and additional information from the GEO database.
+2. **knitr** [@xie2014] to format tables in html using `kable`
+3. **edgeR** [@robinson2010] to apply quantile normalization in the dataset
+4. **biomaRt** [@durinck2009] to obtain HGNC symbols for the Ensembl gene IDs
+
+```{r, warning=FALSE, message=FALSE}
+library(GEOquery)
+library(knitr)
+library(edgeR)
+library(biomaRt)
+```
+
+# Selecting an Expression Dataset
+The dataset I chose has accession [GSE194294](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE194294) and it is basically about how exposure to _Borrelia burgdorferi_, the bacterium responsible for Lyme disease, affects gene expression and DNA methylation in human cells [@berthold2024].
+
+## Choosing this dataset {#choosing-this-dataset}
+I wanted to work with a dataset that was not cancer-specific because I feel like cancer is very common and well-explored in the RNAseq field. Thus, I wanted to look at other datasets that may involve investigating uncommon conditions. I decided to search for Lyme Disease as I have previously worked with it. Surprisingly, there are some datasets available in GEO and after filtering as outlined by my workflow in my [journal entry on dataset selection](https://github.com/bcb420-2025/Chloe_Calica/wiki/Entry-3.2:-Dataset-Selection), I settled on [GSE194294](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE194294) as my final dataset because it:
+
+* used human cell lines for the samples;
+* had an intersting experiment setup were expression is measured based on exposure to _B. burgdorferi_;
+* performed whole-genome RNAseq which means that sequencing targeted all genes instead of just a subset; and
+* was a high quality experiment i.e. three replicates for each condition was utilized, performed on a mature platform (Illumina NovaSeq 6000 with SP flow cell), and was published recently (submitted on 2022 and published on 2024) [@berthold2024]. 
+
+## Dataset Overview {#dataset-overview}
+* **GEO Accession:** [GSE194294](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE194294)
+* **Dataset Name:** Genome-wide transcriptome analysis of human cell models exposed to Borrelia burgdorferi
+* **Publication:** [Changes in the Transcriptome and Long Non-Coding RNAs but Not the Methylome Occur in Human Cells Exposed to Borrelia burgdorferi.](https://pmc.ncbi.nlm.nih.gov/articles/PMC11353914/)
+* **Experimental Design**
+  * A total of 12 samples were used: one control and one condition for each cell line with three replicates each.
+    * **Cell Lines:** HUVEC (human umbilical vein endothelial cells) and HEK-931 (human embryonic kidney cells)
+    * **Condition:** Borrelia burgdorferi strain B31 was added in the growth medium for the cell lines then exposed for about 72 hours.
+    * **Control:** Cells were incubated with just the growth medium
+    * 3 HUVEC-Control, 3 HUVEC-Borr, 3 HEK293-Control, 3 HEK293-Borr
+  * Workflow (Obtained directly from Figure 1 of the original publication [@berthold2024]):
+    ![Experimental Workflow](https://cdn.ncbi.nlm.nih.gov/pmc/blobs/f13e/11353914/3df33a3885c1/genes-15-01010-g001.jpg)
+   
+   **Figure 1. Experimental workflow for human cell models exposed to B. burgdorferi B31.** HUVECs and HEK-293 cells were exposed to B. burgdorferi B31 for 72 h. RNA and DNA were extracted and subjected to library preparation for next-generation sequencing (RNA-seq and enzymatic methyl-seq). Genome-wide epigenomic and transcriptomic data were used for functional enrichment analysis.
+   
+# Dataset Exploration
+## Dataset Summary
+```{r, message=FALSE}
+dataset_geoID <- "GSE194294"
+
+gse <- getGEO(dataset_geoID, GSEMatrix=FALSE)
+```
+**Summary:** `r gse@header$summary`
+
+## Information about the Platform
+```{r}
+curr_gpl <- names(GPLList(gse))[1]
+curr_gpl_info <- Meta(getGEO(curr_gpl))
+```
+
+- **Platform title:** `r curr_gpl_info$title`
+- **Submission date:** `r curr_gpl_info$submission_date`
+- **Last update date:** `r curr_gpl_info$last_update_date`
+- **Organism:** `r curr_gpl_info$organism`
+- **Number of GEO datasets that use this technology:** `r length(curr_gpl_info$series_id)`
+- **Number of GEO samples that use this technology:** `r length(curr_gpl_info$sample_id)`
+
+## Information about the data and its processing
+```{r, eval=FALSE}
+gse@gsms[[1]]@header$data_processing
+```
+`r paste("* ", gse@gsms[[1]]@header$data_processing, collapse = "\n")`
+
+## Get the Expression Data File
+```{r}
+# Get supplementary files
+supp_files <- getGEOSuppFiles(dataset_geoID, fetch_files = FALSE)
+```
+`r paste("* ", supp_files$fname, collapse = "\n")`
+
+Notice that this info is also included in the last three bullet points of the previous section. The file names are straightforward (names of cell lines) and there is also a brief description about each one. They also indicated that this data is raw counts on gene level.
+
+Use the dataset containing both cell lines: **`r supp_files$fname[1]`**
+```{r}
+data_filename <- supp_files$fname[1]
+
+# specify download location
+download_dir <- file.path(getwd())
+
+# check to see if file exists already before downloading
+# only download files that we don't have
+missing_files <- supp_files$fname[!unlist(
+  lapply(supp_files$fname, FUN=function(x){
+    file.exists(
+      file.path(download_dir, dataset_geoID, x)
+    )
+  })
+)]
+
+# Get any files that are still missing 
+if(length(missing_files) > 0){
+  for(i in 1:length(missing_files)){
+    sfiles <- getGEOSuppFiles(dataset_geoID,
+                              filter_regex = missing_files[i],
+                              baseDir = download_dir,
+                              fetch_files = TRUE)
+  }
+}
+
+```
+
+## Read the Data
+Supplementary files had extension `csv.gz` so it is a compressed csv file which can be read using `read.csv()`
+```{r}
+# Read csv file
+both_cells_data <- read.csv(
+  file.path(download_dir, dataset_geoID, data_filename),
+            header = TRUE,
+            check.names = TRUE)
+
+# get the dimensions
+dim(both_cells_data)
+
+# Show a bit of the data
+kable(head(both_cells_data))
+```
+The dimensions of the data seem right. In the paper, they indicated that 26919 genes in HUVEC and 29367 in HEK-293 were found. Although this is not exactly the number of rows above, this is close enough as differences may simply be due to the merging of the two files together. 
+
+As for the columns, they indicated that there were 12 samples and this is exactly what we see in the table, with the 13th column being the gene Ensembl ids. However, the column names are in some sort of a code so we would have to get more information about them.
+
+Since the Ensembl gene ids are in the column, we move change it to rownames instead so we dont' have to account for it everytime we deal with the count data.
+```{r}
+# Set as rownames then delete column
+rownames(both_cells_data) <- both_cells_data$X
+both_cells_data$X <- NULL
+
+# Check that we have removed it and set it as rownames
+dim(both_cells_data)
+head(rownames(both_cells_data))
+```
+
+## Deciphering Column Names
+Sample titles include the codes used in the column names and specifies the cell line and treatment undergone by each sample.
+```{r}
+gse@gsms[[1]]@header$title
+```
+
+Accessing GEO accession for each sample.
+```{r}
+gse@gsms[[1]]@header$geo_accession
+```
+
+Additional information on each sample
+```{r}
+gse@gsms[[1]]@header$characteristics_ch1
+```
+
+## Collect Additional Annotation
+```{r}
+# Obtain all samples for this dataset
+samples <- gse@gsms
+
+# bind them together and gett the title and all the characteristics for each sample
+sample_types <- do.call(rbind, 
+                        lapply(samples, 
+                               FUN=function(x){
+                                 c(x@header$title,
+                                   x@header$characteristics_ch1)
+  
+}))
+
+# head(sample_types)
+```
+
+Clean up sample descriptions.
+```{r}
+colnames(sample_types) <- c("title", "cell line", "cell type", "treatment")
+
+sample_types[, "cell line"] <- gsub(sample_types[, "cell line"], 
+                               pattern = "cell line: ",
+                               replacement = "")
+
+sample_types[, "cell type"] <- gsub(sample_types[, "cell type"], 
+                               pattern = "cell type: ",
+                               replacement = "")
+
+sample_types[, "treatment"] <- gsub(sample_types[, "treatment"], 
+                               pattern = "treatment: ",
+                               replacement = "")
+
+kable(sample_types)
+```
+## Rename sample names
+Since the initial sample names are in some sort of a code and not easily understandable, they will be changed to reflect the information presented in the previous table. This will make it easier to see the changes on between cell types and treatment without having to refer back to the table each time.
+
+The names will be formatted this way: *cellLine_treatment#* where,
+
+- `cellLine` is either HUVEC or HEC293
+- `treatment` is either Borr for Borrelia burgdorferi exposure or Cont for control
+- `#` : indicates which replicate number this sample is
+
+```{r}
+# AB25, 26, 27
+colnames(both_cells_data)[1:3] <- paste0("HUVEC_", paste0("Borr", 1:3))
+
+# AB28, 29, 30
+colnames(both_cells_data)[4:6] <- paste0("HEK293_", paste0("Borr", 1:3))
+
+# AB31, 32, 33
+colnames(both_cells_data)[7:9] <- paste0("HUVEC_", paste0("Cont", 1:3))
+
+# AB34, 35, 36
+colnames(both_cells_data)[10:12] <- paste0("HEK293_", paste0("Cont", 1:3))
+
+colnames(both_cells_data)
+```
+# Data Cleanup
+In this section, we look closely at the data and pre-process it before performing normalization.
+
+## Data Type
+As seen on the section in [Information about the data and its processing](##information-about-the-data-and-its processing), supplementary files are conveniently named with the `rawcounts.csv` extension which made it easy to determine that the data contains raw counts for every gene. To further confirm that it does contain gene level data, we look at the prefix in the rownames. The tables above show that the rownames all start with the prefix `ENSG` confirming that we were given gene level data.
+
+## Initial Dataset Distributions
+Here, we visualize the distribution of the dataset using different types of plots before doing any pre-processing.
+
+### Boxplot
+```{r, warning=FALSE}
+create_boxplot <- function(log2_data){
+  # Move x-axis title because it's being covered
+  par(mgp=c(3.5, 0.5, 0))
+  
+  # Create boxplots
+  boxplot(log2_data, xlab="Samples", ylab="log2 Counts",
+          las=2, cex=0.5, cex.lab=0.5,
+          cex.axis=0.5, main="RNASeq Samples")
+  
+  # Create median line
+  abline(h=median(apply(log2_data, 2, median)),
+         col="red", lwd=1, lty="dashed")  
+}
+
+log2_data <- log2(both_cells_data)
+create_boxplot(log2_data = log2_data)
+```
+
+**Figure 2: Initial boxplots of the dataset.** X-axis is the sample names while y-axis is the log2 transformed count of the data. The dashed red line indicates where the median is for all the samples.
+
+Notice that there's a warning (suppressed for the html) saying saying that "Outlier (-Inf) is not drawn." This is expected because there are samples that have a raw count of 0 so when we got the log2 value of the data, these values became -Inf.
+
+The median value for all datasets is around 5 and we observe that counts are similar within cell lines regardless of treatment while different between cell lines. In both Borr and Cont, HEK293 is above the median while HUVEC is below. There is some subtle difference between treatments but it is hard to tell just from these boxplots alone.
+
+### Density Plot
+```{r}
+create_density_plot <- function(count_density){
+  # Calculate limits from all samples
+  xlim <- 0; ylim <- 0
+  for (i in 1:length(count_density)){
+    xlim <- range(c(xlim, count_density[[i]]$x));
+    ylim <- range(c(ylim, count_density[[i]]$y));
+  }
+  
+  cols <- rainbow(length(count_density))
+  ltys <- rep(1, length(count_density))
+  
+  # Plot first density to initialize plot
+  plot(count_density[[1]], xlim=xlim, ylim=ylim, type="n",
+       ylab="Smoothing density of log2-Counts",
+       xlab="log2-Counts",
+       main="", cex.lab=0.85)
+  
+  # Plot each line
+  for (i in 1:length(count_density))
+    lines(count_density[[i]], col=cols[i], lty=ltys[i])
+  
+  # Legend
+  legend("topright", colnames(both_cells_data), col=cols, lty=ltys,
+         cex=0.75, border="blue", text.col="green4", merge=TRUE, bg="gray90")
+}
+
+count_density1 <- apply(log2(both_cells_data), 2, density)
+create_density_plot(count_density = count_density1)
+```
+
+**Figure 3: Initial density plot of the dataset.** X-axis is the log2 transformed counts while y-axis is the density. Each sample is colored differently from the rest. 
+
+Overall, the shape of the distribution is similar across all samples, but as we saw in the boxplots, cell lines cluster with each other i.e. HEK293 is generally shifted upwards (above the median in boxplots) while HUVEC falls below HEK293 (below median in boxplots). It is interesting to note, however, that around 0 to 0.25 of the x-axis, HUVEC is initially higher that HEK293 and then is distributed similarly before going below HEK293 for the rest of the plot.
+
+## Filtering the Dataset
+The section on [Information about the data and its processing](## Information about the data and its processing) also shows information about how they filtered the dataset in the original study. They filtered lowly expressed genes and kept only those that have "at least more than 1 read in at least 2 samples in one of the groups." 
+
+To replicate this, we set the minimal number of samples to 2 which makes sense given how the samples are set up for the experiment. There is a total of 12 samples and each sample type is always divided equally among all the samples.
+
+- Cell Line: 6 HUVEC and 6 HEK293
+- Treatment: 6 control and 6 Borrelia
+
+In total, there are 4 conditions with 3 replicates each so essentially setting the minimal number of samples to 2 ensures that the genes we keep are found in the majority of the replicates per condition.
+```{r}
+min_num_samples <- 2
+
+data_matrix <- as.matrix(both_cells_data)
+
+# Create the group for each condition
+cond_groups <- c("HUVEC_Borr", "HUVEC_Cont", "HEK293_Borr", "HEK293_Cont")
+
+# convert raw counts to cpm
+cpm_data <- cpm(both_cells_data)
+
+# logical vector to keep track which genes to keep
+keep <- rep(FALSE, nrow(both_cells_data))
+
+# Loop through each group
+for (i in cond_groups){
+  # get all samples that belong to current group
+  group_samples <- grep(paste0("^", i), colnames(both_cells_data))
+  
+  # Check if gene has cpm > 1 in at least 2 samples of the current group
+  # the or condition here makes it so that we still keep the gene as long as it appears once across all the groups
+  keep <- keep | rowSums(cpm_data[, group_samples] > 1) >= min_num_samples
+}
+
+# filter the dataset accdg to the keep vector
+filtered_data_matrix <- data_matrix[keep, ]
+```
+
+After filtering, there are `r dim(filtered_data_matrix)` genes left compared to the initial number of genes which was 29531. To see the if filtering changed the distributions of the data, we create another density plot.
+```{r}
+count_density2 <- apply(log2(filtered_data_matrix), 2, density)
+
+create_density_plot(count_density = count_density2)
+```
+
+**Figure 4: Density plot after filtering.** X-axis is the log2 transformed counts while y-axis is the density. Each sample is colored differently from the rest. 
+
+Compared to Figure 2, filtering got rid of the peak from 0 to 5 which means that a majority of the lowly expressed genes have been filtered. There is still a small peak observed around zero which may indicate biological variability between the samples.
+
+# Normalization
+In this section, the dataset will undergo quantile normalization using functions from the **edgeR** [@robinson2010] package.
+
+## Applying TMM to the dataset
+Create an edgeR container and calculate normalization factors.
+```{r}
+# Convert sample_types to dataframe 
+sample_types <- as.data.frame(sample_types)
+
+# edgeR container of class DGEList
+d_container <- DGEList(counts = filtered_data_matrix, group = sample_types$treatment)
+
+# Get normalization factors
+d_container <- calcNormFactors(d_container)
+
+# Convert to counts per million
+normalized_counts <- cpm(d_container)
+
+# Create density plot again
+count_density3 <- apply(log2(normalized_counts), 2, density)
+create_density_plot(count_density = count_density3)
+```
+
+**Figure 5: Density plot after normalization.** X-axis is the log2 transformed counts while y-axis is the density. Each sample is colored differently from the rest. 
+
+Distribution does not change that much but it gets smoothened out across all samples. We see a narrowing and clustering of the lines which means that we have tightened the distributions therefore making the samples more more comparable against each other.
+
+We create boxplots again to look at the data's distribution after normalization.
+```{r, warning=FALSE}
+log2_data2 <- log2(normalized_counts)
+create_boxplot(log2_data = log2_data2)
+```
+
+**Figure 6: Boxplots of the dataset after normalization.** X-axis is the sample names while y-axis is the log2 transformed count of the data. The dashed red line indicates where the median is for all the samples.
+
+From Figure 6, we see that the median for all samples are lined up in the median line, making the normalization a success. Furthermore, we see the same observations from Figure 2 where we observe that distribution of counts (quartiles) are similar within cell lines regardless of treatment while its different between cell lines. HUVEC has observably a wider quantile than HEK293.
+
+## Outliers {#outliers}
+Figure 6 shows that there are some outliers in the dataset, however, all of them are very close to the end of the boxlot's whiskers so they are not totally off the distribution. Therefore, I decided not to exclude any of this datapoints because they might have only appeared due to biological variability.
+
+Similarly, the original publication did not mention any outliers in their RNA-seq dataset. There was no mention of outliers in both the methods and the supplementary files so it is safe to assumed that they did not have any.
+
+## Sample Separation by MDS
+We do MDS after normalization to visualize the relationships between samples and assess how the data is separated based on the conditions we are interested in. This helps us separate samples based on biological variation rather than sequencing or technical biases.
+
+There are two conditions of interest in this dataset: cell line and treatment.
+
+### Cell Line
+```{r}
+limma::plotMDS(d_container, labels=NULL, pch = 1, 
+               col = c("darkgreen","blue")[factor(sample_types$`cell line`)])
+
+legend("topright", legend=levels(factor(sample_types$`cell line`)), pch=c(1), col= c("darkgreen","blue"),title="Class", bty = 'n', cex = 0.75)
+
+```
+
+**Figure 7: MDS plot based on cell line.** X-axis represents 95% of the variance in the samples while the y-axis represents 1% of the variance.
+
+Classifying by cell lines do not explain majority of the variance in the data as we see different cell lines clustering at the far right, around 4. Because of this, we try to plot the other condition.
+
+### Treatment
+```{r}
+limma::plotMDS(d_container, labels=NULL, pch = 1, 
+               col = c("red","violet")[factor(sample_types$`treatment`)])
+
+legend("topright", legend=levels(factor(sample_types$`treatment`)), pch=c(1), col= c("red","violet"),title="Class", bty = 'n', cex = 0.75)
+
+```
+
+**Figure 8: MDS plot based on treatment.** X-axis represents 95% of the variance in the samples while the y-axis represents 1% of the variance.
+
+Figure 8 shows better separation of conditions than Figure 7. Controls cluster on the left at -4 while those that were exposed to _B. burgdorferi_ cluster on the right at 4. It is interesting to note however that there is still separation among the controls, which can be explained by the difference in cell line as observed in Figure 7. This suggests that treatment effect is more dominant than the cell types effect so we may have to analyze the cell lines separately in downstream analysis, which is excatly what they did in the original publication. 
+
+## Dispersion
+
+```{r}
+model_design <- model.matrix(~sample_types$`cell line` + sample_types$treatment)
+d_dispersion <- estimateDisp(d_container, model_design)
+plotBCV(d_dispersion, col.tagwise = "black",col.common = "red",)
+```
+
+**Figure 9: BCV plot of the normalized data.** Tags or the black points in the plot represent individual genes. The blue trendline represents the general trend of gene dispersion while the red line shows the overall dispersion of the dataset.
+
+The blue trendline on the BCV plot shows that the lowly expressed genes do show a higher biological variability than the highly expressed genes. However, there are only a few outliers and even with the lowly expressed genes, majority of them are below a BCV of 0.5. Additionally, the red line on the plot indicates that the overall variability of the dataset is very low and close to 0.0.
+
+
+```{r, warning=FALSE}
+plotMeanVar(d_dispersion, show.raw.vars = TRUE,show.tagwise.vars=TRUE,
+            show.ave.raw.vars = TRUE, NBline=TRUE,
+            show.binned.common.disp.vars = TRUE)
+
+legend("bottomright", 
+       legend = c("Raw Variance", "Tagwise Variance", "Average Raw Variance", 
+                  "NB Theoretical Line", "Poisson Theoretical Line"),
+       col = c("gray", "lightblue", "red", "black", "blue"),  # Colors matching the plot
+       pch = c(1, 1, 1, NA, NA),  # Use points for variances, lines for the other two
+       lty = c(NA, NA, NA, 1, 1), 
+       lwd = c(NA, NA, NA, 2, 2),  
+       cex = 0.7)
+
+```
+
+**Figure 10: Mean variance of the normalized data.** Variance is plotted as dots and colored differently for raw, tagwise, and average raw values. The negative binomial line is in black while a smoothened line of the common dispersion is in light blue.
+
+From Figure 10, we can see that the data follows the negative-binomial model really well so we can conclude that the NB model assumption holds well for high-expression genes. However, there is some overdispersion (as also observed in the BCV plot) as there are points extending beyond the NB line.
+
+# Identifier Mapping
+## Removing Version Numbers
+Got rid of the version number for the associated ENSEMBL ids since the underlying gene doesn't change regardless of the version number used.
+```{r}
+rownames(normalized_counts) <- unlist(lapply(rownames(normalized_counts), 
+                                            FUN=function(x){unlist(strsplit(x, split = "\\."))[1]}))
+
+head(rownames(normalized_counts))
+```
+## Ensemble ID to HGNC Conversion
+Access **biomaRt** [@durinck2009] to obtain the HGNC symbols
+```{r}
+ensembl <- useDataset("hsapiens_gene_ensembl", mart=useMart("ensembl"))
+
+ids2convert <- rownames(normalized_counts)
+
+# check to see if id_coversion already exists because its 
+# computationally intensive
+conversion_stash <- "id_conversion.rds"
+
+if(file.exists(conversion_stash)){
+  id_conversion <- readRDS(conversion_stash)
+} else {
+  id_conversion <- getBM(attributes = c("ensembl_gene_id","hgnc_symbol"),
+                         filters = c("ensembl_gene_id"), values = ids2convert,
+                         mart = ensembl)
+  saveRDS(id_conversion, conversion_stash)
+}
+
+```
+
+## Mapping Statistics {#mapping-statistics}
+After mapping, we get the following values:
+```{r}
+num_mapped <- length(which(rownames(normalized_counts) 
+                           %in% id_conversion$ensembl_gene_id))
+total <- nrow(normalized_counts)
+```
+
+* Number of genes we were able to map: `r num_mapped`
+* Total genes after normalization: `r total`
+* Difference: `r total-num_mapped`
+* Percent Mapped: `r num_mapped/total*100` %
+
+```{r}
+# Merge the identifiers into the normalized counts table
+normalized_counts_annot <- merge(id_conversion, normalized_counts, by.x = 1,
+                                 by.y = 0, all.y = TRUE)
+kable(head(normalized_counts_annot))
+```
+
+About 0.75% of genes was not mapped to a symbol. Since this is very little, we can simply omit these rows from the data.
+```{r}
+normalized_counts_annot <- normalized_counts_annot[!is.na(normalized_counts_annot$hgnc_symbol), ]
+```
+
+## Processing the Mappings {#processing-the-mappings}
+After mapping the Ensembl IDs to HGNC symbols, still need to account for special situations where one gene may map to multiple HGNC or different genes mapping to the same HGNC.
+
+### One gene and multiple HGNC
+We first look at genes that mapped to multiple HGNC symbols.
+```{r}
+unique(normalized_counts_annot$ensembl_gene_id[duplicated(normalized_counts_annot$ensembl_gene_id)])
+
+normalized_counts_annot[normalized_counts_annot$ensembl_gene_id == "ENSG00000280739", ]
+```
+
+- Surprisingly, there is only one gene mapped to multiple symbols, so it was investigated further by going through the [HGNC](https://www.genenames.org/]) website to gather more information.
+- According to [HGNC](https://www.genenames.org/]), EIF1B-AS1 is a "withdrawn symbol"while ENTPD3-AS1 is the approved symbol and we also see EIF1B-AS1 being listed as one of its previous names.
+- Therefore, only the column with ENTPD3-AS1 is kept.
+
+```{r}
+normalized_counts_annot <- normalized_counts_annot[!(normalized_counts_annot$ensembl_gene_id == "ENSG00000280739" & normalized_counts_annot$hgnc_symbol == "EIF1B-AS1"), ]
+```
+
+### Different genes but one HGNC
+```{r}
+multi_gene <- unique(normalized_counts_annot$hgnc_symbol[duplicated(normalized_counts_annot$hgnc_symbol)])
+
+multi_gene
+```
+
+**Genes mapped to empty string**
+Upon further investigation, these are Ensembl ids that are existing entries in Ensembl but have not been assigned a HGNC symbol because they are novel transcripts or novel proteins. To account for them, I just used the Ensembl ID as the HGNC symbol.
+```{r}
+empty_string_hgnc <- normalized_counts_annot[normalized_counts_annot$hgnc_symbol == "", ]
+
+kable(head(empty_string_hgnc))
+
+normalized_counts_annot$hgnc_symbol[normalized_counts_annot$hgnc_symbol == ""] <- normalized_counts_annot$ensembl_gene_id[normalized_counts_annot$hgnc_symbol == ""]
+
+#check that there are no longer empty strings
+nrow(normalized_counts_annot[normalized_counts_annot$hgnc_symbol == "", ]) == 0
+
+```
+
+For the rest of the genes below, I searched the Ensembl ids in the Ensembl website and saw that most of them mapped to different transcripts so I just annotated the genes with their transcript numbers.
+
+**PINX1 Ensembl Gene IDs.** 
+```{r}
+normalized_counts_annot[normalized_counts_annot$hgnc_symbol == multi_gene[2], ]
+
+# Change HGNC for ENSG00000258724 to PINX1-209
+normalized_counts_annot$hgnc_symbol[normalized_counts_annot$hgnc_symbol == multi_gene[2] & normalized_counts_annot$ensembl_gene_id == "ENSG00000258724"] <- "PINX1-209"
+
+kable(normalized_counts_annot[normalized_counts_annot$hgnc_symbol %in% c("PINX1", "PINX1-209"), ])
+```
+
+**GUSBP11 Ensembl Gene IDs**
+```{r}
+normalized_counts_annot[normalized_counts_annot$hgnc_symbol == multi_gene[3], ]
+
+# Change HGNC for ENSG00000272578 to GUSBP11-490
+normalized_counts_annot$hgnc_symbol[normalized_counts_annot$hgnc_symbol == multi_gene[3] & normalized_counts_annot$ensembl_gene_id == "ENSG00000272578"] <- "GUSBP11-490"
+
+kable(normalized_counts_annot[normalized_counts_annot$hgnc_symbol %in% c("GUSBP11", "GUSBP11-490"), ])
+```
+
+**POLR2J3 Ensembl Gene IDs**
+```{r}
+normalized_counts_annot[normalized_counts_annot$hgnc_symbol == multi_gene[4], ]
+
+# Change HGNC for ENSG00000272578 to GUSBP11-490
+normalized_counts_annot$hgnc_symbol[normalized_counts_annot$hgnc_symbol == multi_gene[4] & normalized_counts_annot$ensembl_gene_id == "ENSG00000168255"] <- "POLR2J3-UPK3BL2"
+
+kable(normalized_counts_annot[normalized_counts_annot$hgnc_symbol %in% c("POLR2J3", "POLR2J3-UPK3BL2"), ])
+```
+
+# Final Normalized Dataset
+```{r}
+kable(head(normalized_counts_annot))
+
+# calculate normalized coverage
+final_coverage <- colSums(normalized_counts_annot[3:14])
+kable(final_coverage)
+
+HUVEC_coverage <- format(mean(final_coverage[c(1:3, 7:9)]), scientific=FALSE)
+HEK293_coverage <- format(mean(final_coverage[c(4:6, 10:12)]), scientific=FALSE)
+```
+
+The final normalized dataset has `r nrow(normalized_counts_annot)` mapped genes with an overall coverage of `r HUVEC_coverage` for the HUVEC samples and an overall coverage of `r HEK293_coverage` for the HEK293 samples.
+
+# Interpret and Document
+
+* [Why is the dataset of interest to you?](#choosing-this-dataset)
+* [What are the control and test conditions of the dataset?](#dataset-overview)
+* [How many samples in each of the conditions of your dataset?](#dataset-overview)
+* [Were there expression values that were not unique for specific genes? How did you handle these?](#processing-the-mappings)
+* [Were there expression values that could not be mapped to current HUGO symbols?](#mapping-statistics)
+* [Were there any outliers in your dataset? How were they handled in the originating paper? How many outliers were removed?](#outliers)
+* How did you handle replicates?
+  * Is this referring to the biological replicates? If so, then they were treated as individual samples. Since there was only 4 conditions and 3 replicates each, there is enough computing power to treat each one as an individual samples.
+* [What is the final coverage of your dataset?](#final-normalized-dataset)
+
+# References
